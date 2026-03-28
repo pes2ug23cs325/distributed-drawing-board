@@ -9,16 +9,19 @@ export default function App() {
   const [tool, setTool] = useState("pen");
   const [lineWidth, setLineWidth] = useState(3);
 
-  const { connected, sendStroke } = useWebSocket(
+  const { connected, sendStroke, sendClear } = useWebSocket(
     "ws://localhost:3000",
-    (stroke) => {
-      setStrokes((prev) => [...prev, stroke]);
+    (message) => {
+      if (message.type === "clear") {
+        setStrokes([]);
+      } else {
+        setStrokes((prev) => [...prev, message]);
+      }
     }
   );
 
   return (
     <div style={styles.page}>
-      {/* HEADER */}
       <div style={styles.header}>
         <h1 style={styles.title}>Distributed Drawing Board</h1>
 
@@ -37,7 +40,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* TOOLBAR */}
       <Toolbar
         color={color}
         setColor={setColor}
@@ -45,10 +47,9 @@ export default function App() {
         setTool={setTool}
         lineWidth={lineWidth}
         setLineWidth={setLineWidth}
-        clearCanvas={() => setStrokes([])}
+        clearCanvas={sendClear}   // 🔥 IMPORTANT FIX
       />
 
-      {/* CANVAS */}
       <Canvas
         strokes={strokes}
         color={color}
@@ -79,7 +80,7 @@ const styles = {
     left: 0,
     width: "100%",
     height: "60px",
-    background: "linear-gradient(90deg, #00c6ff, #0072ff, #7f00ff)", // ✅ only change
+    background: "linear-gradient(90deg, #00c6ff, #0072ff, #7f00ff)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -87,7 +88,7 @@ const styles = {
   },
 
   title: {
-    color: "#ffffff", // ✅ only change
+    color: "#ffffff",
     fontSize: "20px",
     fontWeight: "600",
     margin: 0,

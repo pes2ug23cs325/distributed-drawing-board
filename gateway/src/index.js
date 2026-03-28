@@ -1,102 +1,68 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const axios = require("axios");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.GATEWAY_PORT || 3000;
-const REPLICAS = (process.env.REPLICAS || "").split(",").filter(Boolean);
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-let currentLeader = null;
 let clients = new Set();
 
-// ── Leader Detection ─────────────────────────
+/* -------------------- HEALTH -------------------- */
+app.get("/health", (req, res) => {
+  res.json({
+    status: "gateway up",
+    clients: clients.size,
+  });
+});
 
-async function findLeader() {
-  for (const replica of REPLICAS) {
-    try {
-      const res = await axios.get(`${replica}/status`, { timeout: 500 });
-      if (res.data.state === "leader") {
-        currentLeader = replica;
-        console.log(`[Gateway] Leader = ${replica}`);
-        return;
-      }
-    } catch {}
-  }
-  currentLeader = null;
-}
-
-setInterval(findLeader, 500);
-findLeader();
-
-// ── WebSocket ───────────────────────────────
-
+/* -------------------- WEBSOCKET -------------------- */
 wss.on("connection", (ws) => {
   clients.add(ws);
-  console.log("Client connected");
+  console.log(`[Gateway] Client connected. Total: ${clients.size}`);
 
-  ws.on("message", async (data) => {
-    let parsed;
+  ws.on("message", (data) => {
+    let message;
+
     try {
-      parsed = JSON.parse(data);
-    } catch {
+      message = JSON.parse(data);
+    } catch (err) {
+      console.log("[Gateway] Invalid JSON");
       return;
     }
 
-    if (parsed.type !== "stroke") return;
-
-    if (!currentLeader) await findLeader();
-
-    if (!currentLeader) {
-      console.log("No leader, dropping");
+    /* CLEAR CANVAS */
+    if (message.type === "clear") {
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "clear" }));
+        }
+      }
+      console.log("[Gateway] Clear broadcast sent");
       return;
     }
 
-    try {
-      await axios.post(`${currentLeader}/stroke`, {
-        stroke: parsed.stroke,
-      });
-    } catch {
-      console.log("Leader failed, retrying...");
-      await findLeader();
+    /* STROKE */
+    if (message.type === "stroke") {
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(message.payload));
+        }
+      }
     }
   });
 
   ws.on("close", () => {
     clients.delete(ws);
+    console.log(`[Gateway] Client disconnected. Total: ${clients.size}`);
   });
 });
 
-// ── Broadcast (called by leader after commit) ───────────────
-
-app.post("/broadcast", (req, res) => {
-  const { stroke } = req.body;
-
-  for (const client of clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(
-        JSON.stringify({
-          type: "stroke",
-          stroke,
-        })
-      );
-    }
-  }
-
-  res.json({ success: true });
-});
-
-// ── Health ───────────────────────────────
-
-app.get("/health", (req, res) => {
-  res.json({ leader: currentLeader });
-});
-
+/* -------------------- START -------------------- */
 server.listen(PORT, () => {
-  console.log(`[Gateway] Running on ${PORT}`);
+  console.log(`[Gateway] Running on port ${PORT}`);
 });
