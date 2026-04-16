@@ -1,184 +1,72 @@
-# Distributed Real-Time Drawing Board — Mini-RAFT Consensus
+# Distributed Drawing Board — Mini-RAFT Consensus
 
-A fault-tolerant, real-time collaborative whiteboard built with a custom
-Mini-RAFT consensus protocol, WebSockets, Docker, and React.
+A highly available, fault-tolerant collaborative drawing application built from scratch to demonstrate core distributed systems concepts. This project implements a custom "RAFT-lite" consensus protocol to manage state across a cluster of backend nodes, ensuring zero data loss and real-time synchronization across multiple clients.
 
----
+## 🚀 Features
 
-## Tech Stack
+- **Strict RAFT Consensus**: Enforces mathematically strict majority quorums before committing data, preventing split-brain scenarios and dirty reads.
+- **Automatic Failover & Leader Election**: Nodes use randomized timeouts (150ms-300ms) to automatically detect failures and elect a new leader in under half a second.
+- **High-Performance Write Batching**: The Gateway queues and batches up to 50 WebSocket strokes into single HTTP requests, eliminating TCP socket exhaustion under heavy load.
+- **Zero-Downtime Recovery (Catch-up Sync)**: If a node crashes and reboots, it automatically requests missing log entries from the leader to perfectly restore its state.
+- **Fail-Fast Networking**: Utilizes `AbortController` kill-switches to instantly sever hanging network requests to dead nodes, keeping the event loop unblocked.
+- **Real-Time WebSocket Broadcasting**: Connected clients receive instantaneous, synchronized canvas updates the moment consensus is achieved.
 
-| Layer     | Technology                        |
-|-----------|-----------------------------------|
-| Frontend  | React + Vite                      |
-| Gateway   | Node.js + Express + WebSocket     |
-| Replicas  | Node.js + Express (RAFT protocol) |
-| Infra     | Docker + docker-compose           |
+## 🛠️ Tech Stack
 
----
+- **Gateway**: Node.js, Express, WebSockets (`ws`), Axios
+- **Replicas (RAFT Cluster)**: Node.js, Express, Axios
+- **Frontend**: React, Vite, HTML5 Canvas API
+- **Infrastructure**: Docker, Docker Compose (with hot-reloading via bind mounts)
 
-## Architecture
-```
-Browser Tabs
-     │  WebSocket
-     ▼
-  Gateway (port 3000)
-     │  HTTP
-     ▼
-Leader Replica ──── AppendEntries ────► Follower Replicas
-(replica1/2/3)                          (replica1/2/3)
-     │
-     └──► /broadcast ──► Gateway ──► All Browser Tabs
-```
+## 🏃‍♂️ Quick Start
 
-- **Gateway** accepts all browser WebSocket connections and forwards
-  strokes to the current RAFT leader
-- **3 Replica nodes** run Mini-RAFT consensus — one is elected leader,
-  others are followers
-- **Leader** replicates strokes to followers, waits for majority acks,
-  then commits and broadcasts to all clients via gateway
+Make sure you have Docker and Docker Desktop installed and running.
 
----
+1. **Clone the repository**
+   ```bash
+   git clone [https://github.com/pes2ug23cs325/distributed-drawing-board.git](https://github.com/pes2ug23cs325/distributed-drawing-board.git)
+   cd distributed-drawing-board 
+   ```
+2. **Spin up the cluster**
+   ```bash 
+     docker-compose up --build
+     Open your browser and navigate to:
+     http://localhost:5173 (Open multiple tabs to see real-time synchronization) 
+     ```
 
-## RAFT Protocol Summary
+3. ***Testing Failovers***
+To test the resilience of the RAFT cluster, you can simulate a node crash:
 
-| Property         | Value         |
-|-----------------|---------------|
-| Election timeout | 500–800ms     |
-| Heartbeat interval | 150ms       |
-| Majority quorum  | 2 out of 3    |
+Open a second terminal window.
 
-### Node States
-- **Follower** — waits for heartbeats from leader
-- **Candidate** — starts election when heartbeat times out
-- **Leader** — handles all writes, replicates log, sends heartbeats
+Find the current leader in your Docker logs (e.g., replica2).
 
-### RPC Endpoints (per replica)
-| Endpoint           | Purpose                              |
-|--------------------|--------------------------------------|
-| POST /request-vote | Candidate requests vote from peer    |
-| POST /heartbeat    | Leader keeps followers alive         |
-| POST /append-entries | Leader replicates log entry to follower |
-| POST /sync-log     | Leader pushes missing entries to restarted follower |
-| POST /stroke       | Gateway forwards client stroke to leader |
-| POST /clear        | Gateway forwards canvas clear to leader |
-| POST /clear-replicate | Leader replicates clear to followers |
-| GET  /status       | Returns node state, term, leader ID  |
-| GET  /health       | Returns up/down status               |
-| GET  /log          | Returns full committed log           |
+Kill the container: 
+    ```bash
+     docker stop replica2
+     ```
 
----
+Continue drawing in the browser. The system will automatically elect a new leader, queue your strokes, and resume synchronization seamlessly.
 
-## How to Run
-
-### Prerequisites
-- Docker Desktop installed and running
-- Node.js installed (for stress test only)
-
-### Start the system
-```bash
-docker-compose up --build
-```
-
-### Open the app
-```
-http://localhost:5173
-```
-
-Open in multiple tabs to see real-time sync.
-
-### Check replica status
-```bash
-curl http://localhost:4001/status
-curl http://localhost:4002/status
-curl http://localhost:4003/status
-```
-
-### Check gateway
-```bash
-curl http://localhost:3000/health
-```
-
----
-
-## Stress Test
-
-Sends 100 strokes simultaneously to test system under load.
-
-### Install dependency
-```bash
-npm install ws
-```
-
-### Run
-```bash
-node stress-test.js
-```
-
-You should see 100 strokes appear on all open browser tabs instantly.
-
----
-
-## Failover Demo
-
-### Kill the leader
-```bash
-docker stop replica1   # or whichever is leader
-```
-
-Watch the terminal — within 800ms a new leader is elected automatically.
-All connected browser tabs continue working with zero downtime.
-
-### Restart the killed replica
-```bash
-docker start replica1
-```
-
-The restarted replica catches up via `/sync-log` and rejoins the cluster.
-
-### Hot-reload (zero downtime)
-Edit any file inside `replica1/src/`, `replica2/src/`, or `replica3/src/`.
-nodemon detects the change, restarts that container, triggers a new
-election, and the system stays live throughout.
-
----
-
-## Capturing Failover Logs
-```bash
-docker-compose logs --no-color > logs/failover.log
-```
-
----
-
-## Project Structure
-```
+4. **Project Structure**
+Plaintext
 distributed-drawing-board/
-├── gateway/
-│   ├── src/index.js       # WebSocket server, leader detection, forwarding
+├── gateway/                 # WebSocket server and request router
+│   ├── src/index.js
 │   ├── Dockerfile
 │   └── package.json
-├── replica1/              # Same structure for replica2 and replica3
-│   ├── src/index.js       # Full Mini-RAFT implementation
+├── replica1/                # RAFT Consensus Node 1
+│   ├── src/index.js
 │   ├── Dockerfile
 │   └── package.json
-├── frontend/
+├── replica2/                # RAFT Consensus Node 2
+├── replica3/                # RAFT Consensus Node 3
+├── frontend/                # React Vite Canvas UI
 │   ├── src/
-│   │   ├── App.jsx        # Main app, WebSocket integration
-│   │   ├── Canvas.jsx     # Drawing canvas, local + remote stroke rendering
-│   │   ├── Toolbar.jsx    # Tool selection, color, thickness
-│   │   └── useWebSocket.js # WebSocket hook with auto-reconnect
-│   ├── index.html
+│   │   ├── App.jsx
+│   │   ├── Canvas.jsx
+│   │   └── main.jsx
+│   ├── Dockerfile
 │   └── package.json
-├── stress-test.js         # Load test — sends 100 strokes via WebSocket
-├── docker-compose.yml     # All 5 services with healthchecks
+├── docker-compose.yml       # Cluster orchestration
 └── README.md
-```
-
----
-
-## Week Milestones
-
-| Week | Focus | Status |
-|------|-------|--------|
-| Week 1 | Scaffold, Docker, RAFT design | 
-| Week 2 | Leader election, replication, canvas | 
-| Week 3 | Failover, zero-downtime, stress test |
