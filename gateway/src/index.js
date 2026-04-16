@@ -12,6 +12,9 @@ app.use((req, res, next) => {
   next();
 });
 
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1000 });
+axios.defaults.httpAgent = httpAgent;
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -24,174 +27,139 @@ const REPLICAS = [
 ];
 
 let leaderUrl = null;
-let leaderName = "none";
+let leaderName = "unknown";
+let detectPromise = null;
 
-// ─── Leader detection ─────────────────────────────────────────────────────────
-
-async function detectLeader() {
-  for (const r of REPLICAS) {
+function detectLeader() {
+  if (detectPromise) return detectPromise;
+  detectPromise = (async () => {
     try {
-      const res = await axios.get(`${r.url}/status`, { timeout: 400 });
-      if (res.data.state === "leader") {
-        if (leaderName !== r.id) {
-          console.log(`[Gateway] Leader is now: ${r.id} at ${r.url}`);
+      const promises = REPLICAS.map((r) =>
+        axios.get(`${r.url}/status`, { timeout: 150 }) 
+          .then((res) => (res.data.state === "leader" ? r : null))
+          .catch(() => null)
+      );
+      const results = await Promise.all(promises);
+      const leader = results.find((r) => r !== null);
+      
+      if (leader) {
+        if (leaderName !== leader.id) {
+          console.log(`[Gateway] Leader is now: ${leader.id}`);
         }
-        leaderUrl = r.url;
-        leaderName = r.id;
-        return;
+        leaderUrl = leader.url;
+        leaderName = leader.id;
+      } else {
+        leaderUrl = null;
+        leaderName = "none";
       }
-    } catch (e) {}
-  }
-  leaderUrl = null;
-  leaderName = "none";
-  console.log("[Gateway] No leader found");
+    } finally {
+      detectPromise = null;
+    }
+    return leaderUrl;
+  })();
+  return detectPromise;
 }
 
 setInterval(detectLeader, 500);
-detectLeader();
 
-// ─── Stroke forwarding ────────────────────────────────────────────────────────
+// ─── THE BATCHING QUEUE (The Latency Killer) ─────────────────────────────────
+let queue = [];
+let isProcessing = false;
 
-async function forwardStroke(stroke) {
-  for (let i = 0; i < 3; i++) {
-    if (!leaderUrl) {
-      console.log("[Gateway] No leader, waiting...");
-      await new Promise((r) => setTimeout(r, 300));
-      await detectLeader();
-      continue;
-    }
-    try {
-      console.log(`[Gateway] Forwarding stroke to ${leaderUrl}`);
-      await axios.post(`${leaderUrl}/stroke`, { stroke }, { timeout: 1000 });
-      console.log(`[Gateway] Stroke forwarded successfully`);
-      return;
-    } catch (e) {
-      console.log(`[Gateway] Forward attempt ${i + 1} failed: ${e.message}`);
-      leaderUrl = null;
-      leaderName = "none";
-      await detectLeader();
-    }
-  }
-}
-
-// ─── Forward clear to leader so it replicates to all replicas ─────────────────
-
-async function forwardClear() {
-  for (let i = 0; i < 3; i++) {
-    if (!leaderUrl) {
-      await new Promise((r) => setTimeout(r, 300));
-      await detectLeader();
-      continue;
-    }
-    try {
-      await axios.post(`${leaderUrl}/clear`, {}, { timeout: 1000 });
-      console.log(`[Gateway] Clear forwarded to leader`);
-      return;
-    } catch (e) {
-      console.log(`[Gateway] Clear forward attempt ${i + 1} failed: ${e.message}`);
-      leaderUrl = null;
-      leaderName = "none";
-      await detectLeader();
-    }
-  }
-}
-
-// ─── Fetch full committed log from leader (for new-client state sync) ─────────
-
-async function fetchLeaderLog() {
+async function processQueue() {
+  if (isProcessing || queue.length === 0) return;
+  isProcessing = true;
+  
   if (!leaderUrl) await detectLeader();
-  if (!leaderUrl) return [];
-  try {
-    const res = await axios.get(`${leaderUrl}/log`, { timeout: 1000 });
-    return res.data.log || [];
-  } catch (e) {
-    console.log(`[Gateway] Failed to fetch leader log: ${e.message}`);
-    return [];
+  
+  if (!leaderUrl) {
+    await new Promise(r => setTimeout(r, 50));
+    isProcessing = false;
+    if (queue.length > 0) processQueue();
+    return; 
   }
+
+  // 🔥 BATCHING: Grab up to 50 strokes at once to send in a single HTTP request!
+  const batch = queue.splice(0, Math.min(queue.length, 50));
+
+  try {
+    const clears = batch.filter(i => i.type === "clear");
+    const strokes = batch.filter(i => i.type === "stroke");
+
+    if (clears.length > 0) {
+      await axios.post(`${leaderUrl}/clear`, {}, { timeout: 1000 });
+      for (const c of clients) {
+        if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: "clear" }));
+      }
+    }
+
+    if (strokes.length > 0) {
+      const payloads = strokes.map(s => s.payload);
+      
+      console.log(`[Gateway] (Step 1) Forwarding BATCH of ${strokes.length} strokes to ${leaderName}...`);
+      
+      // Send the entire array of strokes to the new /strokes endpoint
+      await axios.post(`${leaderUrl}/strokes`, { strokes: payloads }, { timeout: 1500 });
+      
+      console.log(`[Gateway] (Step 5) Quorum confirmed by ${leaderName}. Broadcasting batch!`);
+      
+      // Instantly broadcast the successfully saved strokes to the other tabs
+      for (const item of strokes) {
+        for (const c of clients) {
+          if (c !== item.originWs && c.readyState === WebSocket.OPEN) {
+            c.send(JSON.stringify({ type: "stroke", payload: item.payload }));
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // If it fails, put the batch back at the front of the queue
+    queue.unshift(...batch);
+    if (e.response && e.response.status === 500) {
+      await new Promise(r => setTimeout(r, 5));
+    } else {
+      leaderUrl = null;
+      leaderName = "none";
+    }
+  }
+  
+  isProcessing = false;
+  // If more strokes arrived while we were sending, immediately process them
+  if (queue.length > 0) processQueue();
 }
 
-// ─── WebSocket connections ────────────────────────────────────────────────────
-
-wss.on("connection", async (ws) => {
+wss.on("connection", (ws) => {
   clients.add(ws);
   console.log(`[Gateway] Client connected. Total: ${clients.size}`);
 
-  // ── Commit 2: replay full committed log to the newly connected client ──────
-  const existingLog = await fetchLeaderLog();
-  if (existingLog.length > 0 && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "init", payload: existingLog }));
-    console.log(`[Gateway] Sent ${existingLog.length} existing strokes to new client`);
-  }
-
-  ws.on("message", async (msg) => {
+  ws.on("message", (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg);
-    } catch {
-      return;
-    }
-
-    console.log(`[Gateway] Received message type: ${data.type}`);
+    try { data = JSON.parse(msg); } catch { return; }
 
     if (data.type === "clear") {
-      // ── Commit 3: forward clear to leader so replicas clear their logs ──
-      await forwardClear();
-      // Note: broadcast-clear back to WS clients is triggered by the leader
-      // calling POST /broadcast-clear on us (see below). No double-broadcast here.
-      return;
+      queue.push({ type: "clear", originWs: ws });
+      processQueue();
     }
 
     if (data.type === "stroke") {
-      await forwardStroke(data.payload);
+      queue.push({ type: "stroke", payload: data.payload, originWs: ws });
+      processQueue(); 
     }
   });
 
-  ws.on("close", () => {
-    clients.delete(ws);
-    console.log(`[Gateway] Client disconnected. Total: ${clients.size}`);
-  });
-
+  ws.on("close", () => clients.delete(ws));
   ws.on("error", () => clients.delete(ws));
-});
 
-// ─── POST /broadcast — leader calls this to push a committed stroke ───────────
-
-app.post("/broadcast", (req, res) => {
-  const { stroke } = req.body;
-  if (!stroke) return res.status(400).json({ error: "missing stroke" });
-
-  let delivered = 0;
-  for (const c of clients) {
-    if (c.readyState === WebSocket.OPEN) {
-      c.send(JSON.stringify({ type: "stroke", payload: stroke }));
-      delivered++;
+  detectLeader().then(() => {
+    if (leaderUrl) {
+       axios.get(`${leaderUrl}/log`, { timeout: 1000 }).then(res => {
+           if (res.data && res.data.log && ws.readyState === WebSocket.OPEN) {
+               ws.send(JSON.stringify({ type: "init", payload: res.data.log }));
+           }
+       }).catch(() => {});
     }
-  }
-  console.log(`[Gateway] Broadcasted stroke to ${delivered} clients`);
-  res.json({ ok: true });
+  });
 });
 
-// ─── POST /broadcast-clear — leader calls this after clearing its log ─────────
-// Commit 3: replicas clear their logs, then leader calls this to clear all UIs.
-
-app.post("/broadcast-clear", (req, res) => {
-  let delivered = 0;
-  for (const c of clients) {
-    if (c.readyState === WebSocket.OPEN) {
-      c.send(JSON.stringify({ type: "clear" }));
-      delivered++;
-    }
-  }
-  console.log(`[Gateway] Broadcasted clear to ${delivered} clients`);
-  res.json({ ok: true });
-});
-
-// ─── GET /health ──────────────────────────────────────────────────────────────
-
-app.get("/health", (req, res) => {
-  res.json({ leader: leaderName, clients: clients.size });
-});
-
-server.listen(3000, () => {
-  console.log("[Gateway] Running on port 3000");
-});
+app.get("/health", (req, res) => res.json({ leader: leaderName, clients: clients.size }));
+server.listen(3000, () => console.log("[Gateway] Running on port 3000"));

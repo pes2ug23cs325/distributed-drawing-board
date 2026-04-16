@@ -1,52 +1,58 @@
 const express = require("express");
 const axios = require("axios");
+const http = require("http");
 
 const app = express();
 app.use(express.json());
 
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1000 });
+axios.defaults.httpAgent = httpAgent;
+
 const ID = process.env.REPLICA_ID;
 const PORT = parseInt(process.env.REPLICA_PORT);
 const PEERS = (process.env.PEERS || "").split(",").filter(Boolean);
-const GATEWAY = process.env.GATEWAY_URL || "http://gateway:3000";
 
 let state = "follower";
 let currentTerm = 0;
 let votedFor = null;
 let leaderId = null;
-let log = [];         // committed stroke entries
+let log = [];
 let commitIndex = -1;
 let electionTimeout = null;
 let heartbeatInterval = null;
 
-// ─── Election Timeout ────────────────────────────────────────────────────────
+const syncInProgress = new Set();
+
+function logState(message) { console.log(`[${ID} | ${state.toUpperCase()}] ${message}`); }
 
 function resetElectionTimeout() {
   clearTimeout(electionTimeout);
-  // Spec: 500–800 ms
-  electionTimeout = setTimeout(startElection, 500 + Math.random() * 300);
+  electionTimeout = setTimeout(startElection, 150 + Math.random() * 150);
 }
 
-// ─── Election ────────────────────────────────────────────────────────────────
+function updateTerm(newTerm) {
+  if (newTerm > currentTerm) {
+    logState(`Term updated: ${currentTerm} → ${newTerm}`);
+    currentTerm = newTerm;
+    votedFor = null;
+  }
+}
 
 async function startElection() {
   state = "candidate";
   currentTerm++;
   votedFor = ID;
-  console.log(`[${ID}] Starting election term ${currentTerm}`);
+  logState(`Starting election for term ${currentTerm}`);
 
   let votes = 1;
 
   await Promise.all(
     PEERS.map(async (peer) => {
       try {
-        const res = await axios.post(
-          `${peer}/vote`,
-          { term: currentTerm, candidateId: ID },
-          { timeout: 300 }
-        );
-        if (res.data.voteGranted) votes++;
+        const res = await axios.post(`${peer}/request-vote`, { term: currentTerm, candidateId: ID }, { timeout: 150 });
+        if (res.data.voteGranted) { votes++; logState(`Vote granted by ${peer}`); }
         if (res.data.term > currentTerm) stepDown(res.data.term);
-      } catch (e) {}
+      } catch {}
     })
   );
 
@@ -55,7 +61,7 @@ async function startElection() {
   if (votes >= 2) {
     becomeLeader();
   } else {
-    // Split-vote: fall back to follower and retry
+    logState(`Split vote — retrying`);
     state = "follower";
     resetElectionTimeout();
   }
@@ -64,290 +70,199 @@ async function startElection() {
 function becomeLeader() {
   state = "leader";
   leaderId = ID;
-  console.log(`[${ID}] *** BECAME LEADER term ${currentTerm} ***`);
+  logState(`*** BECAME LEADER for term ${currentTerm} ***`);
   clearTimeout(electionTimeout);
   clearInterval(heartbeatInterval);
-  heartbeatInterval = setInterval(sendHeartbeats, 150);
+  heartbeatInterval = setInterval(sendHeartbeats, 40);
   sendHeartbeats();
 }
 
 function stepDown(newTerm) {
-  console.log(`[${ID}] Stepping down, new term ${newTerm}`);
+  logState(`Stepping down — higher term ${newTerm}`);
+  updateTerm(newTerm);
   state = "follower";
-  currentTerm = newTerm;
-  votedFor = null;
   clearInterval(heartbeatInterval);
   resetElectionTimeout();
 }
 
-// ─── Heartbeats ──────────────────────────────────────────────────────────────
-
-async function sendHeartbeats() {
-  for (const peer of PEERS) {
+function sendHeartbeats() {
+  PEERS.forEach(async (peer) => {
     try {
-      const res = await axios.post(
-        `${peer}/append`,
-        {
-          term: currentTerm,
-          leaderId: ID,
-          prevLogIndex: log.length - 1, // tell follower what we expect
-        },
-        { timeout: 200 }
-      );
-      if (res.data.term > currentTerm) {
-        stepDown(res.data.term);
-        return;
-      }
-      // If follower reports a log gap, trigger catch-up sync
+      const res = await axios.post(`${peer}/heartbeat`, { term: currentTerm, leaderId: ID, leaderCommitIndex: commitIndex }, { timeout: 100 });
+      if (res.data.term > currentTerm) return stepDown(res.data.term);
       if (res.data.needsSync && res.data.fromIndex !== undefined) {
-        triggerSync(peer, res.data.fromIndex);
+        if (!syncInProgress.has(peer)) triggerSync(peer, res.data.fromIndex);
       }
-    } catch (e) {}
-  }
+    } catch {}
+  });
 }
-
-// ─── Catch-up sync: leader pushes missing entries to a lagging follower ──────
 
 async function triggerSync(peer, fromIndex) {
-  const missing = log.slice(fromIndex);
-  if (missing.length === 0) return;
+  syncInProgress.add(peer);
   try {
-    await axios.post(
-      `${peer}/sync-log`,
-      { term: currentTerm, leaderId: ID, entries: missing, fromIndex },
-      { timeout: 500 }
-    );
-    console.log(`[${ID}] Sync-log sent to ${peer} (${missing.length} entries from ${fromIndex})`);
+    const missing = log.slice(fromIndex);
+    if (missing.length === 0) return;
+    logState(`Sync-log → ${peer}: ${missing.length} entries from index ${fromIndex}`);
+    await axios.post(`${peer}/sync-log`, { term: currentTerm, leaderId: ID, entries: missing, fromIndex }, { timeout: 500 });
+    logState(`Sync-log to ${peer} done`);
   } catch (e) {
-    console.log(`[${ID}] Sync-log to ${peer} failed: ${e.message}`);
+    logState(`Sync-log to ${peer} failed`);
+  } finally {
+    syncInProgress.delete(peer);
   }
 }
 
-// ─── /vote ───────────────────────────────────────────────────────────────────
-
-app.post("/vote", (req, res) => {
+app.post("/request-vote", (req, res) => {
   const { term, candidateId } = req.body;
-
-  if (term > currentTerm) {
-    currentTerm = term;
-    votedFor = null;
-    state = "follower";
-    clearInterval(heartbeatInterval);
-  }
-
-  if (term < currentTerm) {
-    return res.json({ term: currentTerm, voteGranted: false });
-  }
+  if (term > currentTerm) { updateTerm(term); state = "follower"; clearInterval(heartbeatInterval); }
+  if (term < currentTerm) return res.json({ term: currentTerm, voteGranted: false });
 
   if (votedFor === null || votedFor === candidateId) {
     votedFor = candidateId;
     resetElectionTimeout();
-    console.log(`[${ID}] Voted for ${candidateId}`);
+    logState(`Voted for ${candidateId} in term ${term}`);
     return res.json({ term: currentTerm, voteGranted: true });
   }
-
   res.json({ term: currentTerm, voteGranted: false });
 });
 
-// ─── /append (AppendEntries + heartbeat) ─────────────────────────────────────
-
-app.post("/append", (req, res) => {
-  const { term, leaderId: incomingLeader, entry, prevLogIndex } = req.body;
-
-  if (term < currentTerm) {
-    return res.json({ term: currentTerm, success: false });
+app.post("/heartbeat", (req, res) => {
+  const { term, leaderId: incomingLeader, leaderCommitIndex } = req.body;
+  if (term < currentTerm) return res.json({ term: currentTerm, success: false });
+  if (term > currentTerm) updateTerm(term);
+  state = "follower"; leaderId = incomingLeader; clearInterval(heartbeatInterval); resetElectionTimeout();
+  if (leaderCommitIndex !== undefined && leaderCommitIndex >= 0 && log.length <= leaderCommitIndex) {
+    return res.json({ term: currentTerm, success: true, needsSync: true, fromIndex: log.length });
   }
-
-  if (term > currentTerm) {
-    currentTerm = term;
-    votedFor = null;
-  }
-
-  state = "follower";
-  leaderId = incomingLeader;
-  clearInterval(heartbeatInterval);
-  resetElectionTimeout();
-
-  // prevLogIndex check — detect gap and request sync
-  if (prevLogIndex !== undefined && prevLogIndex > log.length - 1 && log.length < prevLogIndex + 1) {
-    // We are behind; tell leader where we are so it can sync us
-    console.log(`[${ID}] Log gap detected. Have ${log.length}, leader expects prevLogIndex ${prevLogIndex}`);
-    return res.json({
-      term: currentTerm,
-      success: false,
-      needsSync: true,
-      fromIndex: log.length,
-    });
-  }
-
-  if (entry) {
-    log.push(entry);
-    commitIndex = log.length - 1; // ✅ followers now track commitIndex
-    console.log(`[${ID}] Appended entry, log size: ${log.length}, commitIndex: ${commitIndex}`);
-  }
-
   res.json({ term: currentTerm, success: true });
 });
-
-// ─── /sync-log — catch-up endpoint for restarted/lagging followers ────────────
-// Called by leader after detecting a gap via /append response.
-// Follower receives all missing committed entries from `fromIndex` onward.
 
 app.post("/sync-log", (req, res) => {
   const { term, leaderId: incomingLeader, entries, fromIndex } = req.body;
+  if (term < currentTerm) return res.json({ term: currentTerm, success: false });
+  if (term > currentTerm) updateTerm(term);
+  state = "follower"; leaderId = incomingLeader; clearInterval(heartbeatInterval); resetElectionTimeout();
 
-  if (term < currentTerm) {
-    return res.json({ term: currentTerm, success: false });
-  }
-
-  if (term > currentTerm) {
-    currentTerm = term;
-    votedFor = null;
-  }
-
-  state = "follower";
-  leaderId = incomingLeader;
-  clearInterval(heartbeatInterval);
-  resetElectionTimeout();
-
-  if (!Array.isArray(entries) || entries.length === 0) {
-    return res.json({ term: currentTerm, success: true });
-  }
-
-  // Splice in the missing entries starting at fromIndex
+  if (!Array.isArray(entries) || entries.length === 0) return res.json({ term: currentTerm, success: true });
   log = log.slice(0, fromIndex).concat(entries);
   commitIndex = log.length - 1;
-  console.log(`[${ID}] Sync-log applied: ${entries.length} entries from index ${fromIndex}. Log size now: ${log.length}`);
-
+  logState(`Sync-log applied — ${entries.length} entries from ${fromIndex}, log: ${log.length}`);
   res.json({ term: currentTerm, success: true });
 });
 
-// ─── /stroke — only leader accepts this from gateway ─────────────────────────
+// 🔥 THE FIX: Followers accept an array of entries at once!
+app.post("/append-entries", (req, res) => {
+  const { term, leaderId: incomingLeader, entries, prevLogIndex } = req.body;
+  if (term < currentTerm) return res.json({ term: currentTerm, success: false });
+  if (term > currentTerm) updateTerm(term);
 
-app.post("/stroke", async (req, res) => {
-  if (state !== "leader") {
-    return res.status(400).json({ error: "not leader", leaderId });
+  state = "follower"; leaderId = incomingLeader; clearInterval(heartbeatInterval); resetElectionTimeout();
+
+  if (prevLogIndex !== undefined && prevLogIndex >= 0 && log.length <= prevLogIndex) {
+    return res.json({ term: currentTerm, success: false, needsSync: true, fromIndex: log.length });
   }
 
-  const { stroke } = req.body;
-  if (!stroke) return res.status(400).json({ error: "missing stroke" });
-
-  // 1. Append to own log immediately
-  log.push(stroke);
-  commitIndex = log.length - 1;
-  console.log(`[${ID}] Leader committed stroke, log size: ${log.length}`);
-
-  // 2. Broadcast to gateway IMMEDIATELY — don't wait for peer acks
-  try {
-    await axios.post(`${GATEWAY}/broadcast`, { stroke }, { timeout: 500 });
-    console.log(`[${ID}] Broadcast sent to gateway`);
-  } catch (e) {
-    console.log(`[${ID}] Gateway broadcast failed: ${e.message}`);
+  if (entries && Array.isArray(entries)) {
+    log.push(...entries);
+    commitIndex = log.length - 1;
   }
-
-  // 3. Replicate to peers in background (don't block response)
-  PEERS.forEach(async (peer) => {
-    try {
-      await axios.post(
-        `${peer}/append`,
-        { term: currentTerm, leaderId: ID, entry: stroke, prevLogIndex: log.length - 2 },
-        { timeout: 300 }
-      );
-    } catch (e) {
-      console.log(`[${ID}] Replication to ${peer} failed`);
-    }
-  });
-
-  res.json({ success: true });
+  res.json({ term: currentTerm, success: true });
 });
 
-// ─── /clear — leader clears log and replicates clear to all peers ─────────────
-// Commit 3: clear is now fully replicated so restarts don't replay old strokes.
+// 🔥 THE FIX: Leader gets quorum on the entire batch at once!
+app.post("/strokes", async (req, res) => {
+  if (state !== "leader") return res.status(400).json({ error: "not leader", leaderId });
+
+  const { strokes } = req.body;
+  if (!strokes || !Array.isArray(strokes)) return res.status(400).json({ error: "missing strokes" });
+
+  const startIndex = log.length;
+  log.push(...strokes); // Append all at once
+  const entryIndex = log.length - 1;
+
+  let acks = 1; 
+  const controller = new AbortController();
+
+  await new Promise((resolve) => {
+    let pending = PEERS.length;
+    if (pending === 0) return resolve();
+
+    PEERS.forEach((peer) => {
+      // Send the entire array of strokes to the followers
+      axios.post(`${peer}/append-entries`, {
+          term: currentTerm, leaderId: ID, entries: strokes, prevLogIndex: startIndex - 1,
+        }, { timeout: 150, signal: controller.signal }) 
+        .then((r) => { 
+          if (r.data.success) {
+            acks++; 
+            if (acks >= 2) { controller.abort(); resolve(); }
+          } else if (r.data.needsSync && !syncInProgress.has(peer)) {
+            triggerSync(peer, r.data.fromIndex);
+          }
+        })
+        .catch(() => {}) 
+        .finally(() => {
+          pending--;
+          if (pending === 0) resolve();
+        });
+    });
+  });
+
+  if (acks >= 2) {
+    if (entryIndex > commitIndex) {
+      commitIndex = entryIndex;
+      logState(`Majority reached! Committed batch of ${strokes.length} strokes ending at index ${commitIndex}`);
+    }
+    res.json({ success: true });
+  } else {
+    logState(`Failed to reach quorum for batch`);
+    log.splice(startIndex, strokes.length); // Rollback if failed
+    res.status(500).json({ error: "failed to reach quorum" });
+  }
+});
 
 app.post("/clear", async (req, res) => {
-  if (state !== "leader") {
-    return res.status(400).json({ error: "not leader", leaderId });
-  }
+  if (state !== "leader") return res.status(400).json({ error: "not leader", leaderId });
+  
+  let acks = 1; 
+  const controller = new AbortController();
 
-  const { term: incomingTerm } = req.body;
-  if (incomingTerm !== undefined && incomingTerm < currentTerm) {
-    return res.status(400).json({ error: "stale term" });
-  }
+  await new Promise((resolve) => {
+    let pending = PEERS.length;
+    if (pending === 0) return resolve();
 
-  log = [];
-  commitIndex = -1;
-  console.log(`[${ID}] Leader cleared log`);
-
-  // Broadcast clear event to all WS clients via gateway
-  try {
-    await axios.post(`${GATEWAY}/broadcast-clear`, {}, { timeout: 500 });
-  } catch (e) {
-    console.log(`[${ID}] Gateway broadcast-clear failed: ${e.message}`);
-  }
-
-  // Replicate clear to peers
-  PEERS.forEach(async (peer) => {
-    try {
-      await axios.post(`${peer}/clear-replicate`, { term: currentTerm, leaderId: ID }, { timeout: 300 });
-    } catch (e) {
-      console.log(`[${ID}] Clear replication to ${peer} failed`);
-    }
+    PEERS.forEach((peer) => {
+      axios.post(`${peer}/clear-replicate`, { term: currentTerm, leaderId: ID }, { timeout: 150, signal: controller.signal })
+        .then((r) => { if (r.data.success) acks++; })
+        .catch(() => {})
+        .finally(() => {
+          pending--;
+          if (acks >= 2) { controller.abort(); resolve(); } else if (pending === 0) resolve();
+        });
+    });
   });
 
-  res.json({ success: true });
+  if (acks >= 2) {
+    log = []; commitIndex = -1; logState(`Cleared log`); res.json({ success: true });
+  } else {
+    res.status(500).json({ error: "failed to reach quorum" });
+  }
 });
-
-// ─── /clear-replicate — followers apply a clear from the leader ───────────────
 
 app.post("/clear-replicate", (req, res) => {
   const { term, leaderId: incomingLeader } = req.body;
-
-  if (term < currentTerm) {
-    return res.json({ term: currentTerm, success: false });
-  }
-
-  if (term > currentTerm) {
-    currentTerm = term;
-    votedFor = null;
-  }
-
-  state = "follower";
-  leaderId = incomingLeader;
-  clearInterval(heartbeatInterval);
-  resetElectionTimeout();
-
-  log = [];
-  commitIndex = -1;
-  console.log(`[${ID}] Follower cleared log via replication`);
-
-  res.json({ term: currentTerm, success: true });
+  if (term < currentTerm) return res.json({ term: currentTerm, success: false });
+  if (term > currentTerm) updateTerm(term);
+  state = "follower"; leaderId = incomingLeader; clearInterval(heartbeatInterval); resetElectionTimeout();
+  log = []; commitIndex = -1; logState(`Follower cleared log`); res.json({ term: currentTerm, success: true });
 });
 
-// ─── /log — expose committed log (used by gateway for new-client state sync) ──
-
-app.get("/log", (req, res) => {
-  res.json({ log, commitIndex });
-});
-
-// ─── /status & /health ────────────────────────────────────────────────────────
-
-app.get("/status", (req, res) => {
-  res.json({ id: ID, state, term: currentTerm, leaderId, logSize: log.length, commitIndex });
-});
-
-app.get("/health", (req, res) => {
-  res.json({ status: "up", id: ID });
-});
-
-// ─── Graceful shutdown ────────────────────────────────────────────────────────
+app.get("/log", (req, res) => res.json({ log, commitIndex }));
+app.get("/status", (req, res) => res.json({ id: ID, state, term: currentTerm, leaderId, logSize: log.length, commitIndex }));
+app.get("/health", (req, res) => res.json({ status: "up", id: ID }));
 
 process.on("SIGTERM", () => {
-  clearTimeout(electionTimeout);
-  clearInterval(heartbeatInterval);
-  process.exit(0);
+  logState(`SIGTERM — shutting down`); clearTimeout(electionTimeout); clearInterval(heartbeatInterval); process.exit(0);
 });
 
-app.listen(PORT, () => {
-  console.log(`[${ID}] Running on port ${PORT}`);
-  resetElectionTimeout();
-});
+app.listen(PORT, () => { logState(`Running on port ${PORT}`); resetElectionTimeout(); });

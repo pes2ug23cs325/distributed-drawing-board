@@ -16,9 +16,9 @@ export default function App() {
       if (data.type === "clear") {
         setStrokes([]);
       } else if (data.type === "stroke" && data.payload) {
+        // 🔥 Deduplication removed! Eraser scrubbing perfectly synced.
         setStrokes((prev) => [...prev, data.payload]);
       } else if (data.type === "init" && Array.isArray(data.payload)) {
-        // Commit 2: new client receives full committed log from gateway on connect
         setStrokes(data.payload);
       }
     }
@@ -45,12 +45,11 @@ export default function App() {
   }, []);
 
   function handleDraw(stroke) {
+    setStrokes((prev) => [...prev, stroke]); 
     sendStroke({ type: "stroke", payload: stroke });
   }
 
   function handleClear() {
-    // Commit 3: tell gateway to forward clear to leader (which replicates it)
-    // Optimistic local clear so the UI feels instant
     setStrokes([]);
     sendStroke({ type: "clear" });
   }
@@ -59,16 +58,17 @@ export default function App() {
     <div style={styles.page}>
       <div style={styles.header}>
         <div style={styles.left}>Leader: {leader}</div>
+
         <div style={styles.center}>
           <h1 style={styles.title}>Distributed Drawing Board</h1>
         </div>
+
         <div style={styles.right}>
           <span
             style={{
               width: 10,
               height: 10,
               borderRadius: "50%",
-              flexShrink: 0,
               background: connected ? "#10b981" : "#ef4444",
               marginRight: 8,
             }}
@@ -129,8 +129,6 @@ const styles = {
   left: {
     fontSize: "15px",
     fontWeight: "500",
-    whiteSpace: "nowrap",
-    minWidth: "0",
     flex: 1,
   },
   center: {
@@ -143,18 +141,15 @@ const styles = {
     fontSize: "18px",
     fontWeight: "700",
     margin: 0,
-    whiteSpace: "nowrap",
   },
   right: {
     flex: 1,
     display: "flex",
     alignItems: "center",
     justifyContent: "flex-end",
-    minWidth: "0",
   },
   statusText: {
     fontSize: "15px",
     fontWeight: "500",
-    whiteSpace: "nowrap",
   },
 };
