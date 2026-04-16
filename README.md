@@ -77,6 +77,7 @@ git --version
 ```
 
 **Quick Start**
+
 1️⃣ Clone the Repository
 ```bash
 git clone https://github.com/pes2ug23cs325/distributed-drawing-board.git
